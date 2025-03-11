@@ -17,7 +17,7 @@ from langchain_community.document_loaders import (
 )
 from supabase.client import Client, create_client
 
-load_dotenv()
+
 
 
 st.title("Document Q&A ")
