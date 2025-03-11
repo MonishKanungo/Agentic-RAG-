@@ -1,0 +1,10 @@
+streamlit
+langchain
+langchain-groq
+langchain-community
+python-dotenv
+supabase
+uuid
+sentence-transformers
+PyPDF2
+docx2txt
