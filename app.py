@@ -20,7 +20,7 @@ from langchain_community.document_loaders import (
 )
 from supabase.client import Client, create_client
 
-load_dotenv()
+
 
 st.title("Agentic Document Q&A")
 st.write("Upload documents, process them, and ask questions with an agent that can reason through complex queries")
