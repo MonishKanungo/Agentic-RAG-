@@ -9,6 +9,9 @@ from langchain.prompts import PromptTemplate
 from langchain_community.vectorstores import SupabaseVectorStore
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
+from langchain.agents import initialize_agent, AgentType, Tool
+from langchain.memory import ConversationBufferMemory
+from langchain.tools.render import format_tool_to_openai_function
 from langchain_community.document_loaders import (
     PyPDFLoader,
     Docx2txtLoader,
@@ -17,16 +20,15 @@ from langchain_community.document_loaders import (
 )
 from supabase.client import Client, create_client
 
+load_dotenv()
 
-
-
-st.title("Document Q&A ")
-st.write("Upload documents, process them, and ask questions based on your content")
+st.title("Agentic Document Q&A")
+st.write("Upload documents, process them, and ask questions with an agent that can reason through complex queries")
 
 # Sidebar for configuration
 st.sidebar.header("Configuration")
 model_option = st.sidebar.selectbox(
-    "Select  Model",
+    "Select Model",
     ["llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768"]
 )
 temperature = st.sidebar.slider("Temperature", min_value=0.0, max_value=1.0, value=0.1, step=0.1)
@@ -51,6 +53,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "vector_store" not in st.session_state:
     st.session_state.vector_store = None
+if "memory" not in st.session_state:
+    st.session_state.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
 # Setup Supabase client
 try:
@@ -58,7 +62,6 @@ try:
 except Exception as e:
     st.error(f"Error connecting to Supabase: {e}")
     st.stop()
-
 
 try:
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -110,17 +113,12 @@ def process_document(file):
         )
         document_chunks = text_splitter.split_documents(documents)
         
-      
         for chunk in document_chunks:
             chunk.metadata["source"] = file.name
             chunk.metadata["id"] = str(uuid.uuid4())
         
-        
         vector_store = init_vector_store()
-        
-        
         vector_store.add_documents(document_chunks)
-        
         
         os.unlink(file_path)
         
@@ -131,45 +129,131 @@ def process_document(file):
         os.unlink(file_path)
         raise e
 
-# Create RAG chain
-def create_rag_chain():
+# Search tool functions
+def search_documents(query, k=2):
+    """Search for relevant documents based on the query"""
+    vector_store = init_vector_store()
+    docs = vector_store.similarity_search(query, k=k)
+    
+    if not docs:
+        return "No relevant documents found."
+    
+    result = ""
+    for i, doc in enumerate(docs):
+        result += f"\nDocument {i+1} (Source: {doc.metadata.get('source', 'Unknown')})\n"
+        result += f"{doc.page_content}\n"
+    
+    return result
+
+def search_documents_specific(query, source, k=2):
+    """Search for documents from a specific source"""
+    vector_store = init_vector_store()
+    # Use metadata filtering to find documents from the specific source
+    docs = vector_store.similarity_search(
+        query, 
+        k=k,
+        filter={"source": source}
+    )
+    
+    if not docs:
+        return f"No relevant documents found from source: {source}"
+    
+    result = ""
+    for i, doc in enumerate(docs):
+        result += f"\nDocument {i+1} (Source: {doc.metadata.get('source', 'Unknown')})\n"
+        result += f"{doc.page_content}\n"
+    
+    return result
+
+def list_available_sources():
+    """List all available document sources"""
+    if not st.session_state.processed_files:
+        return "No documents have been processed yet."
+    
+    sources = [file["name"] for file in st.session_state.processed_files]
+    return "Available sources:\n" + "\n".join([f"- {source}" for source in sources])
+
+def reformulate_query(original_query):
+    """Reformulate the original query to improve retrieval performance"""
+    llm = ChatGroq(
+        model_name=model_option,
+        groq_api_key=groq_api_key,
+        temperature=0.2,
+    )
+    
+    prompt = f"""Given the original user query: "{original_query}"
+    
+    Please reformulate this query to make it more effective for retrieval from a vector database. 
+    Focus on extracting key entities, concepts, and using synonyms where appropriate.
+    Return only the reformulated query with no additional explanation."""
+    
+    response = llm.invoke(prompt)
+    return response.content
+
+# Create agentic RAG system
+def create_agentic_rag():
     # Initialize LLM
     llm = ChatGroq(
         model_name=model_option,
         groq_api_key=groq_api_key,
         temperature=temperature,
-        max_tokens=512,
     )
     
-   
-    vector_store = init_vector_store()
-    retriever = vector_store.as_retriever(search_kwargs={"k": k_docs})
+    # Define tools
+    tools = [
+        Tool(
+            name="SearchDocuments",
+            func=lambda q: search_documents(q, k=k_docs),
+            description="Useful for when you need to search for information in all the documents. Input should be a search query."
+        ),
+        Tool(
+            name="SearchSpecificSource",
+            func=lambda q: search_documents_specific(q.split("|||")[0], q.split("|||")[1], k=k_docs),
+            description="Search for information in a specific document. Input should be in format: 'query|||source' (e.g., 'climate change|||report.pdf')."
+        ),
+        Tool(
+            name="ListSources",
+            func=list_available_sources,
+            description="Lists all available document sources that have been processed."
+        ),
+        Tool(
+            name="ReformulateQuery",
+            func=reformulate_query,
+            description="Reformulates the original query to improve retrieval performance. Input should be the original query."
+        )
+    ]
     
-    
-    template = """Answer the following question based ONLY on the provided context. If the answer is not found in the context, simply state "I don't have enough information to answer this question."
-
-    Question: {question}
-
-    Context: {context}
-
-    Answer:"""
-    
-    PROMPT = PromptTemplate(template=template, input_variables=["context", "question"])
-    
-    # Create QA chain
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs={"prompt": PROMPT},
-        return_source_documents=True,
+    # Initialize agent with tools
+    agent = initialize_agent(
+        tools,
+        llm,
+        agent=AgentType.OPENAI_FUNCTIONS,
+        verbose=True,
+        memory=st.session_state.memory,
+        handle_parsing_errors=True,
     )
     
-    return qa_chain
+    # Enhance agent system message for better reasoning
+    system_message = """You are an intelligent research assistant that helps users find information in their documents.
 
+    Follow these steps when answering questions:
+    1. Determine if you need to search for information in the documents
+    2. Consider if you should reformulate the query to get better results
+    3. Decide which documents to search in (all or specific sources)
+    4. Analyze the retrieved information critically
+    5. If the information is insufficient, try searching with different queries
+    6. Synthesize information from multiple sources when appropriate
+    7. Provide clear attribution to sources
 
-tab1, tab2 = st.tabs(["Upload Documents", "Chat with Documents"])
+    If you cannot find an answer in the documents, clearly state that you don't have enough information.
+    Always show your reasoning process step by step.
+    """
+    
+    agent.agent.prompt.messages[0].content = system_message
+    
+    return agent
 
+tab1, tab2 = st.tabs(["Upload Documents", "Chat with Agent"])
 
 with tab1:
     st.header("Upload Your Documents")
@@ -205,7 +289,6 @@ with tab1:
         for file in st.session_state.processed_files:
             st.write(f"📄 {file['name']} - {file['chunks']} chunks")
 
-
 with tab2:
     st.header("Ask Questions About Your Documents")
     
@@ -216,7 +299,7 @@ with tab2:
         # Display chat history
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
-                st.write(message["content"])
+                st.markdown(message["content"])
         
         # Chat input
         if prompt := st.chat_input("Ask a question about your documents"):
@@ -229,23 +312,15 @@ with tab2:
             
             # Display assistant response
             with st.chat_message("assistant"):
-                with st.spinner("Searching through documents..."):
+                with st.spinner("Searching through documents and reasoning about your question..."):
                     message_placeholder = st.empty()
                     
                     try:
-                        # Create chain with current settings
-                        chain = create_rag_chain()
+                        # Create agent with current settings
+                        agent = create_agentic_rag()
                         
                         # Get response
-                        result = chain({"query": prompt})
-                        response = result["result"]
-                        
-                        # Display sources if available
-                        if "source_documents" in result and result["source_documents"]:
-                            response += "\n\n**Sources:**"
-                            for i, doc in enumerate(result["source_documents"]):
-                                source = doc.metadata.get('source', 'Unknown source')
-                                response += f"\n{i+1}. {source}"
+                        response = agent.run(prompt)
                         
                         message_placeholder.markdown(response)
                         
@@ -254,5 +329,3 @@ with tab2:
                         
                     except Exception as e:
                         message_placeholder.error(f"Error: {str(e)}")
-
-
