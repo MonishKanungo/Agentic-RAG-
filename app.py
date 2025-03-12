@@ -1,263 +1,312 @@
 import os
 import streamlit as st
 import tempfile
-from dotenv import load_dotenv
 import uuid
+from dotenv import load_dotenv
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain_community.vectorstores import SupabaseVectorStore
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
-from langchain.agents import initialize_agent, AgentType, Tool
-from langchain.memory import ConversationBufferMemory
-from langchain.tools.render import format_tool_to_openai_function
 from langchain_community.document_loaders import (
     PyPDFLoader,
     Docx2txtLoader,
     TextLoader,
-    CSVLoader
+    CSVLoader,
 )
 from supabase.client import Client, create_client
+from langchain.agents import AgentType, initialize_agent, Tool
+from langchain.memory import ConversationBufferMemory
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-
-st.title("Agentic Document Q&A")
-st.write("Upload documents, process them, and ask questions with an agent that can reason through complex queries")
-
-# Sidebar for configuration
-st.sidebar.header("Configuration")
-model_option = st.sidebar.selectbox(
-    "Select Model",
-    ["llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768"]
-)
-temperature = st.sidebar.slider("Temperature", min_value=0.0, max_value=1.0, value=0.1, step=0.1)
-k_docs = st.sidebar.slider("Number of documents to retrieve", min_value=1, max_value=5, value=2)
-chunk_size = st.sidebar.slider("Chunk Size", min_value=500, max_value=3000, value=1000, step=100)
-chunk_overlap = st.sidebar.slider("Chunk Overlap", min_value=0, max_value=500, value=100, step=10)
-
-# Environment variables
-supabase_url = os.environ.get("SUPABASE_URL")
-supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
-groq_api_key = os.environ.get("GROQ_API_KEY")
-
-# Check for required environment variables
-if not all([supabase_url, supabase_key, groq_api_key]):
-    st.error("Missing required environment variables. Please check your .env file.")
-    st.stop()
-
-# Initialize session state variables
 if "processed_files" not in st.session_state:
     st.session_state.processed_files = []
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = None
-if "memory" not in st.session_state:
-    st.session_state.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
-# Setup Supabase client
-try:
-    supabase = create_client(supabase_url, supabase_key)
-except Exception as e:
-    st.error(f"Error connecting to Supabase: {e}")
-    st.stop()
+if "query_history" not in st.session_state:
+    st.session_state.query_history = []
+model_options = ["llama3-70b-8192", "mixtral-8x7b-32768", "gemma-7b-it"]
+model_option = st.sidebar.selectbox("Select Model", model_options)
+temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.7)
+chunk_size = st.sidebar.slider("Chunk Size", 500, 2000, 1000)
+chunk_overlap = st.sidebar.slider("Chunk Overlap", 0, 500, 200)
+k_docs = st.sidebar.slider("Number of documents to retrieve", 1, 10, 4)
 
-try:
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-except Exception as e:
-    st.error(f"Error loading embeddings model: {e}")
-    st.stop()
+# Advanced options
+with st.sidebar.expander("Advanced Settings"):
+    enable_debug = st.checkbox("Enable Debug Mode", value=False)
+    reasoning_depth = st.select_slider(
+        "Reasoning Depth",
+        options=["Basic", "Standard", "Deep"],
+        value="Standard"
+    )
+    max_tokens = st.number_input("Max Tokens", min_value=256, max_value=8192, value=1024)
 
-# Initialize vector store
+def check_api_keys():
+    missing_keys = []
+    if not GROQ_API_KEY:
+        missing_keys.append("GROQ_API_KEY")
+    if not SUPABASE_URL:
+        missing_keys.append("SUPABASE_URL")
+    if not SUPABASE_KEY:
+        missing_keys.append("SUPABASE_KEY")
+    
+    if missing_keys:
+        st.error(f"Missing environment variables: {', '.join(missing_keys)}. Please add them to your .env file.")
+        return False
+    return True
+
+def init_supabase_client():
+    if not check_api_keys():
+        return None
+    try:
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as e:
+        st.error(f"Error connecting to Supabase: {str(e)}")
+        return None
+        
 def init_vector_store():
-    if st.session_state.vector_store is None:
-        try:
-            st.session_state.vector_store = SupabaseVectorStore(
-                embedding=embeddings,
-                client=supabase,
-                table_name="documents",
-                query_name="match_documents",
-            )
-        except Exception as e:
-            st.error(f"Error initializing vector store: {e}")
-            st.stop()
-    return st.session_state.vector_store
-
-# Function to load and process documents
-def process_document(file):
-    # Create a temporary file to save the uploaded file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file.name.split(".")[-1]}') as tmp_file:
-        tmp_file.write(file.getvalue())
-        file_path = tmp_file.name
+    supabase_client = init_supabase_client()
+    if not supabase_client:
+        return None
     
     try:
-        # Check file extension and use appropriate loader
-        if file.name.endswith('.pdf'):
-            loader = PyPDFLoader(file_path)
-        elif file.name.endswith('.docx'):
-            loader = Docx2txtLoader(file_path)
-        elif file.name.endswith('.csv'):
-            loader = CSVLoader(file_path)
-        else:  # Default to text loader
-            loader = TextLoader(file_path)
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        vector_store = SupabaseVectorStore(
+            client=supabase_client,
+            embedding=embeddings,
+            table_name="documents",
+            query_name="match_documents"
+        )
+        return vector_store
+    except Exception as e:
+        st.error(f"Error initializing vector store: {str(e)}")
+        return None
         
-        # Load documents
+def process_document(file):
+    # Create a temporary file
+    suffix = os.path.splitext(file.name)[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
+        temp.write(file.read())
+        temp_path = temp.name
+    
+    try:
+        if suffix.lower() == ".pdf":
+            loader = PyPDFLoader(temp_path)
+        elif suffix.lower() == ".docx":
+            loader = Docx2txtLoader(temp_path)
+        elif suffix.lower() == ".txt":
+            loader = TextLoader(temp_path)
+        elif suffix.lower() == ".csv":
+            loader = CSVLoader(temp_path)
+        else:
+            os.unlink(temp_path)
+            raise ValueError(f"Unsupported file format: {suffix}")
+        
         documents = loader.load()
         
-        # Split documents into chunks
+        
+        file_id = str(uuid.uuid4())
+        for doc in documents:
+            doc.metadata["source"] = file.name
+            doc.metadata["file_id"] = file_id
+
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            length_function=len,
+            chunk_overlap=chunk_overlap
         )
-        document_chunks = text_splitter.split_documents(documents)
+        chunks = text_splitter.split_documents(documents)
         
-        for chunk in document_chunks:
-            chunk.metadata["source"] = file.name
-            chunk.metadata["id"] = str(uuid.uuid4())
-        
-        vector_store = init_vector_store()
-        vector_store.add_documents(document_chunks)
-        
-        os.unlink(file_path)
-        
-        return len(document_chunks)
     
+        vector_store = init_vector_store()
+        if vector_store:
+            vector_store.add_documents(chunks)
+        else:
+            raise ValueError("Vector store initialization failed")
+        
+        
+        os.unlink(temp_path)
+        
+        return len(chunks)
     except Exception as e:
-        # Clean up temp file
-        os.unlink(file_path)
+        
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
         raise e
 
-# Search tool functions
-def search_documents(query, k=2):
-    """Search for relevant documents based on the query"""
-    vector_store = init_vector_store()
-    docs = vector_store.similarity_search(query, k=k)
-    
-    if not docs:
-        return "No relevant documents found."
-    
-    result = ""
-    for i, doc in enumerate(docs):
-        result += f"\nDocument {i+1} (Source: {doc.metadata.get('source', 'Unknown')})\n"
-        result += f"{doc.page_content}\n"
-    
-    return result
-
-def search_documents_specific(query, source, k=2):
-    """Search for documents from a specific source"""
-    vector_store = init_vector_store()
-    # Use metadata filtering to find documents from the specific source
-    docs = vector_store.similarity_search(
-        query, 
-        k=k,
-        filter={"source": source}
-    )
-    
-    if not docs:
-        return f"No relevant documents found from source: {source}"
-    
-    result = ""
-    for i, doc in enumerate(docs):
-        result += f"\nDocument {i+1} (Source: {doc.metadata.get('source', 'Unknown')})\n"
-        result += f"{doc.page_content}\n"
-    
-    return result
-
-def list_available_sources():
-    """List all available document sources"""
-    if not st.session_state.processed_files:
-        return "No documents have been processed yet."
-    
-    sources = [file["name"] for file in st.session_state.processed_files]
-    return "Available sources:\n" + "\n".join([f"- {source}" for source in sources])
-
-def reformulate_query(original_query):
-    """Reformulate the original query to improve retrieval performance"""
-    llm = ChatGroq(
-        model_name=model_option,
-        groq_api_key=groq_api_key,
-        temperature=0.2,
-    )
-    
-    prompt = f"""Given the original user query: "{original_query}"
-    
-    Please reformulate this query to make it more effective for retrieval from a vector database. 
-    Focus on extracting key entities, concepts, and using synonyms where appropriate.
-    Return only the reformulated query with no additional explanation."""
-    
-    response = llm.invoke(prompt)
-    return response.content
-
-# Create agentic RAG system
-def create_agentic_rag():
-    # Initialize LLM
-    llm = ChatGroq(
-        model_name=model_option,
-        groq_api_key=groq_api_key,
-        temperature=temperature,
-    )
-    
-    # Define tools
-    tools = [
-        Tool(
-            name="SearchDocuments",
-            func=lambda q: search_documents(q, k=k_docs),
-            description="Useful for when you need to search for information in all the documents. Input should be a search query."
-        ),
-        Tool(
-            name="SearchSpecificSource",
-            func=lambda q: search_documents_specific(q.split("|||")[0], q.split("|||")[1], k=k_docs),
-            description="Search for information in a specific document. Input should be in format: 'query|||source' (e.g., 'climate change|||report.pdf')."
-        ),
-        Tool(
-            name="ListSources",
-            func=list_available_sources,
-            description="Lists all available document sources that have been processed."
-        ),
-        Tool(
-            name="ReformulateQuery",
-            func=reformulate_query,
-            description="Reformulates the original query to improve retrieval performance. Input should be the original query."
+# Function to create enhanced RAG tool with reasoning
+def create_rag_tool():
+    if not check_api_keys():
+        return None
+        
+    try:
+        llm = ChatGroq(
+            model_name=model_option,
+            groq_api_key=GROQ_API_KEY,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
+        
+        vector_store = init_vector_store()
+        if not vector_store:
+            raise ValueError("Vector store initialization failed")
+            
+        retriever = vector_store.as_retriever(search_kwargs={"k": k_docs})
+        
+  
+        template = """
+        # Objective
+        Answer the user's question based ONLY on the provided context from their documents.
+        
+        # Reasoning Process
+        1. First, analyze the user's question: {question}
+        2. Identify the key information needed to answer this question
+        3. Carefully review the retrieved context
+        4. Consider what the context says and doesn't say about the question
+        
+        # Retrieved Context
+        {context}
+        
+        # Instructions
+        - If the answer is clearly found in the context, provide it with specific references
+        - If the context contains partial information, provide what's available and acknowledge limitations
+        - If the context doesn't contain relevant information, state "I don't have enough information in the documents to answer this question"
+        - DO NOT use information outside the provided context
+        - Cite specific sources from the documents when possible
+        
+        # Answer
+        """
+        
+        PROMPT = PromptTemplate(template=template, input_variables=["context", "question"])
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            retriever=retriever,
+            chain_type_kwargs={"prompt": PROMPT},
+            return_source_documents=True,
+        )
+
+        def rag_tool(query: str):
+            result = qa_chain({"query": query})
+            response = result["result"]
+            
+            # Add source information
+            if "source_documents" in result and result["source_documents"]:
+                sources = []
+                for i, doc in enumerate(result["source_documents"]):
+                    source = doc.metadata.get("source", "Unknown source")
+                    sources.append(f"{i+1}. {source}")
+                
+                if sources:
+                    response += "\n\n**Sources:**\n" + "\n".join(sources)
+            
+            return response
+
+        return Tool(
+            name="Document Retrieval and Analysis Tool",
+            func=rag_tool,
+            description="Analyzes the documents to find relevant information, reason about it, and provide well-sourced answers.",
+        )
+    except Exception as e:
+        st.error(f"Error creating RAG tool: {str(e)}")
+        return None
+
+def create_agent():
+    if not check_api_keys():
+        return None
+        
+    try:
+        rag_tool = create_rag_tool()
+        if not rag_tool:
+            raise ValueError("RAG tool initialization failed")
+            
+        tools = [rag_tool]
+        
+    
+        memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True,
+            output_key="output"
+        )
+        
+        llm = ChatGroq(
+            model_name=model_option,
+            groq_api_key=GROQ_API_KEY,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        
+     
+        system_message = f"""
+        You are an advanced document analysis assistant that helps users understand their documents.
+        
+        Follow this reasoning process for each query:
+        1. UNDERSTAND: First, understand exactly what the user is asking
+        2. PLAN: Determine what information you need to find in the documents
+        3. RETRIEVE: Use your document retrieval tool to get relevant information
+        4. ANALYZE: Carefully examine the retrieved information
+        5. SYNTHESIZE: Combine information from multiple sources if needed
+        6. REASON: Draw logical conclusions based on the evidence
+        7. RESPOND: Provide a clear, concise answer with source references
+        
+        Reasoning depth: {reasoning_depth}
+        
+        Important guidelines:
+        - Only use information found in the user's documents
+        - Cite specific sources
+        - Acknowledge limitations in the available information
+        - Be truthful and accurate
+        """
+        
+        agent_chain = initialize_agent(
+            tools,
+            llm,
+            agent=AgentType.CHAT_CONVERSATIONAL_REACT_DESCRIPTION,
+            verbose=enable_debug,
+            memory=memory,
+            agent_kwargs={
+                "system_message": system_message
+            }
+        )
+        
+        return agent_chain
+    except Exception as e:
+        st.error(f"Error creating agent: {str(e)}")
+        return None
+        
+def display_reasoning(query):
+    st.write("🧠 **Reasoning Process**")
+    
+    reasoning_steps = [
+        "**Understanding Query**: Analyzing what information is being requested",
+        "**Planning Retrieval**: Determining key terms and concepts to search for",
+        "**Analyzing Documents**: Examining retrieved information for relevance",
+        "**Synthesizing Answer**: Combining information from multiple sources"
     ]
     
-    # Initialize agent with tools
-    agent = initialize_agent(
-        tools,
-        llm,
-        agent=AgentType.OPENAI_FUNCTIONS,
-        verbose=True,
-        memory=st.session_state.memory,
-        handle_parsing_errors=True,
-    )
-    
-    # Enhance agent system message for better reasoning
-    system_message = """You are an intelligent research assistant that helps users find information in their documents.
+    with st.expander("View Reasoning Steps", expanded=False):
+        for step in reasoning_steps:
+            st.write(step)
+            st.progress(100)
+            
+# Streamlit UI
+st.title(" Document Q&A Assistant")
 
-    Follow these steps when answering questions:
-    1. Determine if you need to search for information in the documents
-    2. Consider if you should reformulate the query to get better results
-    3. Decide which documents to search in (all or specific sources)
-    4. Analyze the retrieved information critically
-    5. If the information is insufficient, try searching with different queries
-    6. Synthesize information from multiple sources when appropriate
-    7. Provide clear attribution to sources
-
-    If you cannot find an answer in the documents, clearly state that you don't have enough information.
-    Always show your reasoning process step by step.
-    """
-    
-    agent.agent.prompt.messages[0].content = system_message
-    
-    return agent
-
-tab1, tab2 = st.tabs(["Upload Documents", "Chat with Agent"])
+tab1, tab2, tab3 = st.tabs(["Upload Documents", "Chat with Documents", "Query History"])
 
 with tab1:
     st.header("Upload Your Documents")
     st.write("Supported formats: PDF, DOCX, TXT, CSV")
+    
+ 
+    if not check_api_keys():
+        st.warning("Please add API keys to your .env file before proceeding")
     
     uploaded_files = st.file_uploader(
         "Choose files to upload",
@@ -277,7 +326,8 @@ with tab1:
                         num_chunks = process_document(file)
                         st.session_state.processed_files.append({
                             "name": file.name,
-                            "chunks": num_chunks
+                            "chunks": num_chunks,
+                            "processed_at": uuid.uuid4()  # To force refresh when reprocessed
                         })
                         st.success(f"Successfully processed {file.name} into {num_chunks} chunks")
                     except Exception as e:
@@ -286,46 +336,83 @@ with tab1:
     # Display processed files
     if st.session_state.processed_files:
         st.subheader("Processed Documents")
-        for file in st.session_state.processed_files:
-            st.write(f"📄 {file['name']} - {file['chunks']} chunks")
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            for file in st.session_state.processed_files:
+                st.write(f"📄 {file['name']} - {file['chunks']} chunks")
+        
+        with col2:
+            if st.button("Clear All Documents"):
+                # This doesn't delete from Supabase - would need additional implementation
+                st.session_state.processed_files = []
+                st.experimental_rerun()
 
 with tab2:
     st.header("Ask Questions About Your Documents")
-    
-    # Check if documents are processed
     if not st.session_state.processed_files:
         st.warning("Please upload and process documents first")
     else:
-        # Display chat history
+        # Initialize or refresh agent when needed
+        agent_needs_refresh = False
+        if "agent" not in st.session_state:
+            agent_needs_refresh = True
+        elif st.sidebar.button("Refresh Agent"):
+            agent_needs_refresh = True
+            
+        if agent_needs_refresh:
+            with st.spinner("Initializing Q&A agent..."):
+                st.session_state.agent = create_agent()
+                if not st.session_state.agent:
+                    st.error("Failed to initialize agent. Check the logs for errors.")
+
+        # Display chat messages
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-        
+                st.write(message["content"])
+
         # Chat input
         if prompt := st.chat_input("Ask a question about your documents"):
-            # Add user message to chat history
             st.session_state.messages.append({"role": "user", "content": prompt})
-            
-            # Display user message
             with st.chat_message("user"):
                 st.write(prompt)
             
-            # Display assistant response
             with st.chat_message("assistant"):
-                with st.spinner("Searching through documents and reasoning about your question..."):
-                    message_placeholder = st.empty()
+                if enable_debug:
+                    display_reasoning(prompt)
                     
+                with st.spinner("Analyzing documents and reasoning..."):
                     try:
-                        # Create agent with current settings
-                        agent = create_agentic_rag()
-                        
-                        # Get response
-                        response = agent.run(prompt)
-                        
-                        message_placeholder.markdown(response)
-                        
-                        # Add assistant response to chat history
-                        st.session_state.messages.append({"role": "assistant", "content": response})
-                        
+                        if st.session_state.agent:
+                            response = st.session_state.agent.run(input=prompt)
+                            st.write(response)
+                            st.session_state.messages.append({"role": "assistant", "content": response})
+                            
+                            # Add to query history
+                            st.session_state.query_history.append({
+                                "query": prompt,
+                                "response": response,
+                                "timestamp": uuid.uuid4()  # Simple timestamp substitute
+                            })
+                        else:
+                            st.error("Agent not initialized. Please refresh the page and try again.")
                     except Exception as e:
-                        message_placeholder.error(f"Error: {str(e)}")
+                        error_msg = f"Error: {str(e)}"
+                        st.error(error_msg)
+                        st.session_state.messages.append({"role": "assistant", "content": f"I encountered an error: {error_msg}"})
+
+with tab3:
+    st.header("Query History")
+    if not st.session_state.query_history:
+        st.info("No queries yet. Ask questions in the Chat tab to build history.")
+    else:
+        for i, item in enumerate(reversed(st.session_state.query_history)):
+            with st.expander(f"Query: {item['query'][:50]}{'...' if len(item['query']) > 50 else ''}", expanded=(i == 0)):
+                st.write("**Your question:**")
+                st.write(item["query"])
+                st.write("**Assistant's answer:**")
+                st.write(item["response"])
+                
+                if st.button(f"Ask this again", key=f"reuse_{i}"):
+                   
+                    st.session_state.reuse_query = item["query"]
+                    st.experimental_rerun()
