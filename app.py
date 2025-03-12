@@ -31,7 +31,7 @@ if "messages" not in st.session_state:
 
 if "query_history" not in st.session_state:
     st.session_state.query_history = []
-model_options = ["llama3-70b-8192", "mixtral-8x7b-32768", "gemma-7b-it"]
+model_options = ["llama3-70b-8192", "mixtral-8x7b-32768", "gemma2-9b-it"]
 model_option = st.sidebar.selectbox("Select Model", model_options)
 temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.7)
 chunk_size = st.sidebar.slider("Chunk Size", 500, 2000, 1000)
